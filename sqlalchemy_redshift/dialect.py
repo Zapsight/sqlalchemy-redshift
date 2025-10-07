@@ -1013,7 +1013,9 @@ class RedshiftDialectMixin(DefaultDialect):
         elif sa_version >= Version('1.4.0') and 'identity' not in kw:
             kw['identity'] = None
 
-        column_info = super(RedshiftDialectMixin, self)._get_column_info(
+        # Use super() without arguments to properly traverse the MRO
+        # This works correctly with multiple inheritance
+        column_info = super()._get_column_info(
             *args,
             **kw
         )
