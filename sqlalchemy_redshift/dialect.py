@@ -17,6 +17,16 @@ from sqlalchemy.dialects.postgresql.psycopg2 import PGDialect_psycopg2
 from sqlalchemy.dialects.postgresql.psycopg2cffi import PGDialect_psycopg2cffi
 from sqlalchemy.engine import reflection
 from sqlalchemy.engine.default import DefaultDialect
+
+# Import ObjectKind if available (SQLAlchemy 2.0+)
+try:
+    from sqlalchemy.engine.reflection import ObjectKind
+except ImportError:
+    # For backward compatibility with SQLAlchemy < 2.0
+    class ObjectKind:
+        TABLE = 'table'
+        VIEW = 'view'
+        MATERIALIZED_VIEW = 'materialized_view'
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.expression import (BinaryExpression, BooleanClauseList,
                                        Delete)
@@ -885,6 +895,16 @@ class RedshiftDialectMixin(DefaultDialect):
         return self._get_table_or_view_names('v', connection, schema, **kw)
 
     @reflection.cache
+    def get_materialized_view_names(self, connection, schema=None, **kw):
+        """
+        Return a list of materialized view names for `schema`.
+
+        Overrides interface
+        :meth:`~sqlalchemy.engine.interfaces.Dialect.get_materialized_view_names`.
+        """
+        return self._get_table_or_view_names('m', connection, schema, **kw)
+
+    @reflection.cache
     def get_view_definition(self, connection, view_name, schema=None, **kw):
         """Return view definition.
         Given a :class:`.Connection`, a string `view_name`,
@@ -1193,6 +1213,319 @@ class RedshiftDialectMixin(DefaultDialect):
 
     def _set_backslash_escapes(self, connection):
         self._backslash_escapes = False
+
+    def _load_domains(self, connection):
+        """
+        Override PostgreSQL's _load_domains to avoid querying pg_collation.
+        
+        Redshift is based on PostgreSQL 8.0.2 and doesn't have pg_collation.
+        Redshift doesn't support user-defined domains, so we return an empty dict.
+        """
+        # Redshift doesn't support user-defined domains
+        return {}
+
+    def _load_enums(self, connection, schema=None):
+        """
+        Override PostgreSQL's _load_enums to avoid querying pg_enum.
+        
+        Redshift doesn't support user-defined enum types.
+        """
+        # Redshift doesn't support user-defined enums
+        return {}
+
+    def get_multi_columns(self, connection, schema=None, filter_names=None,
+                         kind=ObjectKind.TABLE, **kw):
+        """
+        Return information about columns for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        We override to use Redshift-specific reflection queries.
+        """
+        # Use the existing batch reflection logic
+        info_cache = kw.get('info_cache')
+        all_columns = self._get_schema_column_info(
+            connection,
+            schema=schema,
+            info_cache=info_cache
+        )
+        
+        if not self._domains:
+            self._domains = self._load_domains(connection)
+        domains = self._domains
+        
+        result = {}
+        for relation_key, cols in all_columns.items():
+            # Apply filter if provided
+            if filter_names is not None and relation_key.name not in filter_names:
+                continue
+            
+            # Apply schema filter
+            if schema is not None and relation_key.schema != schema:
+                continue
+                
+            columns = []
+            for col in cols:
+                column_info = self._get_column_info(
+                    name=col.name, format_type=col.format_type,
+                    default=col.default, notnull=col.notnull, domains=domains,
+                    enums=[], schema=col.schema, encode=col.encode,
+                    comment=col.comment)
+                columns.append(column_info)
+            
+            # Return using tuple key (schema, table_name)
+            result_key = (relation_key.schema, relation_key.name)
+            result[result_key] = columns
+            
+        return result.items()
+
+    def get_multi_pk_constraint(self, connection, schema=None, 
+                               filter_names=None,
+                               kind=ObjectKind.TABLE, **kw):
+        """
+        Return information about primary keys for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        """
+        info_cache = kw.get('info_cache')
+        all_constraints = self._get_all_constraint_info(
+            connection,
+            schema=schema,
+            info_cache=info_cache
+        )
+        
+        result = {}
+        for relation_key, constraints in all_constraints.items():
+            # Apply filter if provided
+            if filter_names is not None and relation_key.name not in filter_names:
+                continue
+            
+            # Apply schema filter
+            if schema is not None and relation_key.schema != schema:
+                continue
+            
+            pk_constraints = [c for c in constraints if c.contype == 'p']
+            if not pk_constraints:
+                pk_info = {'constrained_columns': [], 'name': None}
+            else:
+                pk_constraint = pk_constraints[0]
+                m = PRIMARY_KEY_RE.match(pk_constraint.condef)
+                if m:
+                    colstring = m.group('columns')
+                    constrained_columns = SQL_IDENTIFIER_RE.findall(colstring)
+                    pk_info = {
+                        'constrained_columns': constrained_columns,
+                        'name': pk_constraint.conname,
+                    }
+                else:
+                    pk_info = {'constrained_columns': [], 'name': None}
+            
+            # Return using tuple key (schema, table_name)
+            result_key = (relation_key.schema, relation_key.name)
+            result[result_key] = pk_info
+            
+        return result.items()
+
+    def get_multi_foreign_keys(self, connection, schema=None,
+                              filter_names=None,
+                              kind=ObjectKind.TABLE, **kw):
+        """
+        Return information about foreign keys for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        """
+        info_cache = kw.get('info_cache')
+        all_constraints = self._get_all_constraint_info(
+            connection,
+            schema=schema,
+            info_cache=info_cache
+        )
+        
+        result = {}
+        for relation_key, constraints in all_constraints.items():
+            # Apply filter if provided
+            if filter_names is not None and relation_key.name not in filter_names:
+                continue
+            
+            # Apply schema filter
+            if schema is not None and relation_key.schema != schema:
+                continue
+            
+            fk_constraints = [c for c in constraints if c.contype == 'f']
+            uniques = defaultdict(lambda: defaultdict(dict))
+            for con in fk_constraints:
+                uniques[con.conname]["key"] = con.conkey
+                uniques[con.conname]["condef"] = con.condef
+            
+            fkeys = []
+            for conname, attrs in uniques.items():
+                m = FOREIGN_KEY_RE.match(attrs['condef'])
+                if m:
+                    colstring = m.group('referred_columns')
+                    referred_columns = SQL_IDENTIFIER_RE.findall(colstring)
+                    referred_table = m.group('referred_table')
+                    referred_schema = m.group('referred_schema')
+                    colstring = m.group('columns')
+                    constrained_columns = SQL_IDENTIFIER_RE.findall(colstring)
+                    fkey_d = {
+                        'name': conname,
+                        'constrained_columns': constrained_columns,
+                        'referred_schema': referred_schema,
+                        'referred_table': referred_table,
+                        'referred_columns': referred_columns,
+                    }
+                    fkeys.append(fkey_d)
+            
+            # Return using tuple key (schema, table_name)
+            result_key = (relation_key.schema, relation_key.name)
+            result[result_key] = fkeys
+            
+        return result.items()
+
+    def get_multi_unique_constraints(self, connection, schema=None,
+                                    filter_names=None,
+                                    kind=ObjectKind.TABLE, **kw):
+        """
+        Return information about unique constraints for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        """
+        info_cache = kw.get('info_cache')
+        all_constraints = self._get_all_constraint_info(
+            connection,
+            schema=schema,
+            info_cache=info_cache
+        )
+        
+        result = {}
+        for relation_key, constraints in all_constraints.items():
+            # Apply filter if provided
+            if filter_names is not None and relation_key.name not in filter_names:
+                continue
+            
+            # Apply schema filter
+            if schema is not None and relation_key.schema != schema:
+                continue
+            
+            constraint_list = [c for c in constraints if c.contype == 'u']
+            uniques = defaultdict(lambda: defaultdict(dict))
+            for con in constraint_list:
+                uniques[con.conname]["key"] = con.conkey
+                uniques[con.conname]["cols"][con.attnum] = con.attname
+            
+            unique_constraints = [
+                {'name': name,
+                 'column_names': [uc["cols"][i] for i in uc["key"]]}
+                for name, uc in uniques.items()
+            ]
+            
+            # Return using tuple key (schema, table_name)
+            result_key = (relation_key.schema, relation_key.name)
+            result[result_key] = unique_constraints
+            
+        return result.items()
+
+    def get_multi_check_constraints(self, connection, schema=None,
+                                   filter_names=None,
+                                   kind=ObjectKind.TABLE, **kw):
+        """
+        Return information about check constraints for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        """
+        # Get all tables we need to process
+        if filter_names:
+            table_names = filter_names
+        else:
+            table_names = self.get_table_names(connection, schema=schema, **kw)
+        
+        result = {}
+        for table_name in table_names:
+            # Use existing get_check_constraints method
+            check_constraints = self.get_check_constraints(
+                connection, table_name, schema=schema, **kw
+            )
+            
+            # Return using tuple key (schema, table_name)
+            result_key = (schema, table_name)
+            result[result_key] = check_constraints
+            
+        return result.items()
+
+    def get_multi_indexes(self, connection, schema=None, filter_names=None,
+                         kind=ObjectKind.TABLE, **kw):
+        """
+        Return information about indexes for multiple tables.
+        
+        Redshift doesn't support traditional indexes, so this returns empty lists.
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        """
+        # Get all tables we need to process
+        if filter_names:
+            table_names = filter_names
+        else:
+            table_names = self.get_table_names(connection, schema=schema, **kw)
+        
+        result = {}
+        for table_name in table_names:
+            # Redshift doesn't support indexes
+            result_key = (schema, table_name)
+            result[result_key] = []
+            
+        return result.items()
+
+    def get_multi_table_comment(self, connection, schema=None,
+                               filter_names=None,
+                               kind=ObjectKind.TABLE, **kw):
+        """
+        Return table comments for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        Redshift doesn't support table comments in the same way as PostgreSQL.
+        """
+        # Get all tables we need to process
+        if filter_names:
+            table_names = filter_names
+        else:
+            table_names = self.get_table_names(connection, schema=schema, **kw)
+        
+        result = {}
+        for table_name in table_names:
+            # Redshift doesn't support table comments
+            result_key = (schema, table_name)
+            result[result_key] = {'text': None}
+            
+        return result.items()
+
+    def get_multi_table_options(self, connection, schema=None,
+                               filter_names=None,
+                               kind=ObjectKind.TABLE, **kw):
+        """
+        Return table options for multiple tables.
+        
+        This is a batch method introduced in SQLAlchemy 2.0 for performance.
+        """
+        # Get all tables we need to process
+        if filter_names:
+            table_names = filter_names
+        else:
+            table_names = self.get_table_names(connection, schema=schema, **kw)
+        
+        result = {}
+        for table_name in table_names:
+            # Use existing get_table_options method
+            try:
+                table_options = self.get_table_options(
+                    connection, table_name, schema, **kw
+                )
+            except Exception:
+                # If there's an error, return empty options
+                table_options = {}
+            
+            # Return using tuple key (schema, table_name)
+            result_key = (schema, table_name)
+            result[result_key] = table_options
+            
+        return result.items()
 
 
 class Psycopg2RedshiftDialectMixin(RedshiftDialectMixin):
