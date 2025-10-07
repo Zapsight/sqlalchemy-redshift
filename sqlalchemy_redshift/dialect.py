@@ -1013,9 +1013,11 @@ class RedshiftDialectMixin(DefaultDialect):
         elif sa_version >= Version('1.4.0') and 'identity' not in kw:
             kw['identity'] = None
 
-        # Use super() without arguments to properly traverse the MRO
-        # This works correctly with multiple inheritance
-        column_info = super()._get_column_info(
+        # Call PGDialect's _get_column_info directly since RedshiftDialectMixin
+        # inherits from DefaultDialect, not PGDialect. The actual dialect instances
+        # (like RedshiftDialect_psycopg2) use multiple inheritance to include both.
+        column_info = PGDialect._get_column_info(
+            self,
             *args,
             **kw
         )
