@@ -1000,34 +1000,135 @@ class RedshiftDialectMixin(DefaultDialect):
                 relation_names.append(key.name)
         return relation_names
 
-    def _get_column_info(self, *args, **kwargs):
-        kw = kwargs.copy()
-        encode = kw.pop('encode', None)
-        if sa_version >= Version('1.3.16'):
-            # SQLAlchemy 1.3.16 introduced generated columns,
-            # not supported in redshift
-            kw['generated'] = ''
-
-        if sa_version < Version('1.4.0') and 'identity' in kw:
-            del kw['identity']
-        elif sa_version >= Version('1.4.0') and 'identity' not in kw:
-            kw['identity'] = None
-
-        # Call PGDialect's _get_column_info directly since RedshiftDialectMixin
-        # inherits from DefaultDialect, not PGDialect. The actual dialect instances
-        # (like RedshiftDialect_psycopg2) use multiple inheritance to include both.
-        column_info = PGDialect._get_column_info(
-            self,
-            *args,
-            **kw
-        )
+    def _get_column_info(self, name, format_type, default, notnull, domains, enums, 
+                         schema, encode=None, comment=None, **kwargs):
+        """
+        Parse column information from PostgreSQL/Redshift format.
+        
+        This method handles both SQLAlchemy 1.4 and 2.0+. In SQLAlchemy 2.0,
+        PGDialect._get_column_info was removed, so we implement it ourselves.
+        """
+        # In SQLAlchemy 1.4, delegate to PGDialect if available
+        if sa_version < Version('2.0.0') and hasattr(PGDialect, '_get_column_info'):
+            kw = kwargs.copy()
+            kw['encode'] = encode
+            kw['comment'] = comment
+            if sa_version >= Version('1.3.16'):
+                kw['generated'] = ''
+            if sa_version < Version('1.4.0') and 'identity' in kw:
+                del kw['identity']
+            elif sa_version >= Version('1.4.0') and 'identity' not in kw:
+                kw['identity'] = None
+            
+            column_info = PGDialect._get_column_info(
+                self, name, format_type, default, notnull, domains, enums, schema, **kw
+            )
+        else:
+            # SQLAlchemy 2.0+ implementation - parse types ourselves
+            # This is based on the PostgreSQL type parsing logic
+            from sqlalchemy import util
+            from sqlalchemy.dialects.postgresql import ARRAY, BYTEA, ENUM
+            
+            # Parse the type from format_type
+            # Handle "character varying" specially
+            if format_type.startswith('character varying'):
+                type_name = 'character varying'
+            elif format_type.startswith('timestamp without time zone'):
+                type_name = 'timestamp without time zone'
+            elif format_type.startswith('timestamp with time zone'):
+                type_name = 'timestamp with time zone'
+            elif format_type.startswith('time without time zone'):
+                type_name = 'time without time zone'
+            elif format_type.startswith('time with time zone'):
+                type_name = 'time with time zone'
+            elif format_type.startswith('double precision'):
+                type_name = 'double precision'
+            else:
+                attype = re.search(r'^\w+', format_type)
+                if attype:
+                    type_name = attype.group(0)
+                else:
+                    type_name = format_type
+            
+            # Check if it's a domain type
+            if type_name in domains:
+                type_name = domains[type_name]['attype']
+            
+            # Check for array types
+            is_array = format_type.endswith('[]')
+            if is_array:
+                format_type = format_type[:-2]
+                type_name = type_name[:-2] if type_name.endswith('[]') else type_name
+            
+            # Get the column type from ischema_names
+            try:
+                coltype = self.ischema_names[type_name]
+            except KeyError:
+                util.warn(f"Did not recognize type '{type_name}' of column '{name}'")
+                coltype = sa.types.NULLTYPE
+            
+            # Handle type arguments (e.g., VARCHAR(255))
+            type_args = []
+            type_kwargs = {}
+            
+            # Parse precision/scale for types like NUMERIC(10,2) or VARCHAR(255)
+            m = re.search(r'\((.*?)\)', format_type)
+            if m:
+                arg_str = m.group(1)
+                if ',' in arg_str:
+                    # e.g., NUMERIC(10,2)
+                    parts = arg_str.split(',')
+                    type_args = [int(p.strip()) for p in parts]
+                else:
+                    # e.g., VARCHAR(255)
+                    try:
+                        type_args = [int(arg_str.strip())]
+                    except ValueError:
+                        pass
+            
+            # Instantiate the type
+            if isinstance(coltype, type):
+                try:
+                    coltype = coltype(*type_args, **type_kwargs)
+                except TypeError:
+                    coltype = coltype()
+            
+            # Handle array types
+            if is_array:
+                coltype = ARRAY(coltype)
+            
+            # Build the column info dictionary
+            column_info = {
+                'name': name,
+                'type': coltype,
+                'nullable': not notnull,
+                'default': default,
+            }
+            
+            # Add identity information if available
+            identity = kwargs.get('identity')
+            if identity is not None:
+                column_info['identity'] = identity
+            
+            # Add autoincrement information if available  
+            if 'autoincrement' in kwargs:
+                column_info['autoincrement'] = kwargs['autoincrement']
+            
+            # Add comment if available
+            if comment:
+                column_info['comment'] = comment
+        
+        # Redshift-specific handling: VARCHAR without length becomes NullType
         if isinstance(column_info['type'], VARCHAR):
             if column_info['type'].length is None:
                 column_info['type'] = NullType()
+        
+        # Add encode information to the info dict
         if 'info' not in column_info:
             column_info['info'] = {}
         if encode and encode != 'none':
             column_info['info']['encode'] = encode
+            
         return column_info
 
     def _get_redshift_relation(self, connection, table_name,
